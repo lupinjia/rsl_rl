@@ -8,13 +8,21 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-from itertools import chain
+from collections.abc import Iterator
+from itertools import chain, repeat
 from tensordict import TensorDict
 
 from rsl_rl.env import VecEnv
-from rsl_rl.extensions import RandomNetworkDistillation, Symmetry, resolve_rnd_config, resolve_symmetry_config
+from rsl_rl.extensions import (
+    RandomNetworkDistillation,
+    Symmetry,
+    resolve_amp_config,
+    resolve_rnd_config,
+    resolve_symmetry_config,
+)
+from rsl_rl.extensions.amp import AMPDiscriminator, AMPLossType
 from rsl_rl.models import MLPModel
-from rsl_rl.storage import RolloutStorage
+from rsl_rl.storage import CircularBuffer, RolloutStorage
 from rsl_rl.utils import compile_model, resolve_class, resolve_obs_groups, resolve_optimizer
 
 
@@ -30,6 +38,9 @@ class PPO:
 
     critic: MLPModel
     """The critic model."""
+
+    amp_discriminator: AMPDiscriminator | None = None
+    """The AMP discriminator model."""
 
     def __init__(
         self,
@@ -58,6 +69,11 @@ class PPO:
         symmetry_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
+        # AMP parameters
+        amp_cfg: dict | None = None,
+        amp_discriminator: AMPDiscriminator | None = None,
+        disc_obs_buffer: CircularBuffer | None = None,
+        disc_demo_obs_buffer: CircularBuffer | None = None,
     ) -> None:
         """Initialize the algorithm with models, storage, and optimization settings."""
         # Device-related parameters
@@ -113,6 +129,18 @@ class PPO:
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
         self.use_mixed_precision = use_mixed_precision
 
+        # AMP discriminator (optional). ``amp_cfg`` is consumed by construct_algorithm and
+        # kept here only for configuration compatibility.
+        self.amp_discriminator = amp_discriminator.to(self.device) if amp_discriminator is not None else None
+        self._raw_amp_discriminator = amp_discriminator
+        # AMP observation buffers
+        self.disc_obs_buffer = disc_obs_buffer
+        self.disc_demo_obs_buffer = disc_demo_obs_buffer
+        # AMP reward tracking
+        self.style_rewards: torch.Tensor | None = None
+        self.rewards_lerp: torch.Tensor | None = None
+        self.disc_score: torch.Tensor | None = None
+
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample actions and store transition data."""
         # Record the hidden states for recurrent policies
@@ -130,6 +158,9 @@ class PPO:
         self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
     ) -> None:
         """Record one environment step."""
+        # Allow extension hooks to transform the rewards (e.g. AMP style reward interpolation)
+        rewards = self._process_step_rewards(obs, rewards, dones, extras)
+
         # Record the rewards and dones
         # Note: We clone here because later on we bootstrap the rewards based on timeouts
         self.transition.rewards = rewards.clone()
@@ -182,6 +213,143 @@ class PPO:
         if not self.normalize_advantage_per_mini_batch:
             st.advantages = (st.advantages - st.advantages.mean()) / (st.advantages.std() + 1e-8)
 
+    def _process_step_rewards(
+        self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """Transform the per-step task rewards (e.g. AMP style reward interpolation).
+
+        Returns the rewards that are stored in the transition. The default
+        implementation returns ``rewards`` unchanged.
+        """
+        if self.amp_discriminator is None:
+            return rewards
+
+        # Get discriminator observations
+        disc_obs = self.amp_discriminator.get_disc_obs(obs, flatten_history_dim=False)
+        disc_demo_obs = self.amp_discriminator.get_disc_obs_from_demo(obs, flatten_history_dim=False)
+
+        # Handle terminal observations for done environments
+        if "terminal_obs" in extras:
+            terminal_disc_obs = self.amp_discriminator.get_disc_obs(extras["terminal_obs"], flatten_history_dim=False)
+            done_mask = dones.to(dtype=torch.bool)
+            if torch.any(done_mask):
+                disc_obs = disc_obs.clone()
+                disc_obs[done_mask] = terminal_disc_obs[done_mask]
+
+        # Compute style reward
+        step_dt = self.amp_discriminator.step_dt
+        self.style_rewards, self.disc_score = self.amp_discriminator.predict_style_reward(disc_obs, dt=step_dt)
+
+        # Interpolate between task and style rewards
+        self.rewards_lerp = self.amp_discriminator.lerp_reward(task_reward=rewards, style_reward=self.style_rewards)
+
+        # Store observations in buffers
+        self.disc_obs_buffer.append(disc_obs)
+        self.disc_demo_obs_buffer.append(disc_demo_obs)
+
+        # Update AMP normalizer
+        self.amp_discriminator.update_normalization(disc_obs)
+
+        return self.rewards_lerp
+
+    def _extra_mini_batch_iter(self) -> Iterator[tuple]:
+        """Yield extra per-mini-batch data, zipped with the storage batches in :meth:`update`.
+
+        Each item is a ``(disc_obs_agent, disc_obs_demo)`` pair of tensors, or
+        ``(None, None)`` when no extension provides extra data. The returned iterator
+        must yield at least as many items as the storage generator.
+        """
+        if self.amp_discriminator is None:
+            return repeat((None, None))
+        disc_obs_generator = self.disc_obs_buffer.mini_batch_generator(
+            fetch_length=self.storage.num_transitions_per_env,
+            num_mini_batches=self.num_mini_batches,
+            num_epochs=self.num_learning_epochs,
+        )
+        disc_demo_obs_generator = self.disc_demo_obs_buffer.mini_batch_generator(
+            fetch_length=self.storage.num_transitions_per_env,
+            num_mini_batches=self.num_mini_batches,
+            num_epochs=self.num_learning_epochs,
+        )
+        return zip(disc_obs_generator, disc_demo_obs_generator)
+
+    def _compute_aux_loss(
+        self, batch: RolloutStorage.Batch, disc_obs_batch: TensorDict | None
+    ) -> tuple[torch.Tensor | None, dict]:
+        """Compute an auxiliary loss for the mini-batch (e.g. AMP discriminator loss).
+
+        Returns ``(loss, metrics)``; a ``None`` loss means no auxiliary loss is active.
+        """
+        if self.amp_discriminator is None or disc_obs_batch is None:
+            return None, {}
+        amp_loss, amp_loss_dict = self.amp_discriminator.compute_loss(
+            disc_obs_batch["disc_obs_agent"], disc_obs_batch["disc_obs_demo"]
+        )
+        return amp_loss, amp_loss_dict
+
+    def _compute_aux_gradients(self, aux_loss: torch.Tensor | None) -> None:
+        """Zero and backpropagate an auxiliary loss (e.g. AMP discriminator loss)."""
+        if self.amp_discriminator is not None and aux_loss is not None:
+            self.amp_discriminator.optimizer.zero_grad()
+            aux_loss.backward()
+
+    def _step_aux_optimizers(self) -> None:
+        """Step the optimizers of auxiliary modules (e.g. AMP discriminator)."""
+        if self.amp_discriminator is not None:
+            self.amp_discriminator.optimizer.step()
+
+    def _train_aux_modules(self) -> None:
+        """Put auxiliary modules into train mode."""
+        if self.amp_discriminator is not None:
+            self.amp_discriminator.train()
+            self.amp_discriminator.disc_obs_normalizer.train()
+
+    def _eval_aux_modules(self) -> None:
+        """Put auxiliary modules into eval mode."""
+        if self.amp_discriminator is not None:
+            self.amp_discriminator.eval()
+            self.amp_discriminator.disc_obs_normalizer.eval()
+
+    def _compile_aux_modules(self, mode: str | None) -> None:
+        """Compile auxiliary modules."""
+        if self.amp_discriminator is not None:
+            self.amp_discriminator = compile_model(self._raw_amp_discriminator, mode)  # type: ignore
+
+    def _aux_save_state(self) -> dict:
+        """Return state-dict entries of auxiliary modules for saving."""
+        if self.amp_discriminator is None:
+            return {}
+        return {
+            "amp_discriminator_state_dict": self.amp_discriminator.state_dict(),
+            "amp_discriminator_optimizer_state_dict": self.amp_discriminator.optimizer.state_dict(),
+        }
+
+    def _load_aux_state(self, loaded_dict: dict, load_cfg: dict, strict: bool) -> None:
+        """Load state-dict entries of auxiliary modules."""
+        if load_cfg.get("amp_discriminator") and self.amp_discriminator is not None:
+            self.amp_discriminator.load_state_dict(loaded_dict["amp_discriminator_state_dict"], strict=strict)
+            if load_cfg.get("optimizer") and "amp_discriminator_optimizer_state_dict" in loaded_dict:
+                self.amp_discriminator.optimizer.load_state_dict(loaded_dict["amp_discriminator_optimizer_state_dict"])
+
+    def _aux_parameters(self) -> list[Iterator[nn.Parameter]]:
+        """Return parameter iterables of auxiliary modules for multi-GPU gradient reduction."""
+        if self.amp_discriminator is None:
+            return []
+        return [self.amp_discriminator.parameters()]
+
+    def _aux_broadcast_state_dicts(self) -> list[dict]:
+        """Return state dicts of auxiliary modules for multi-GPU parameter broadcasting."""
+        if self.amp_discriminator is None:
+            return []
+        return [self.amp_discriminator.state_dict()]
+
+    def _load_aux_broadcast_state_dicts(self, model_params: list, idx: int) -> int:
+        """Consume broadcast state dicts of auxiliary modules; return the updated index."""
+        if self.amp_discriminator is not None:
+            self.amp_discriminator.load_state_dict(model_params[idx])
+            idx += 1
+        return idx
+
     def update(self) -> dict[str, float]:
         """Run optimization epochs over stored batches and return mean losses."""
         mean_value_loss = 0
@@ -191,6 +359,15 @@ class PPO:
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
         mean_symmetry_loss = 0 if self.symmetry else None
+        # AMP loss
+        if self.amp_discriminator is not None:
+            mean_amp_loss = 0.0
+            mean_agent_score = 0.0
+            mean_demo_score = 0.0
+        else:
+            mean_amp_loss = None
+            mean_agent_score = None
+            mean_demo_score = None
 
         # Get mini-batch generator
         if self.actor.is_recurrent or self.critic.is_recurrent:
@@ -199,8 +376,21 @@ class PPO:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
         # Iterate over mini-batches
-        for batch in generator:
+        # ``zip`` stops at the end of the shortest iterator; ``_extra_mini_batch_iter``
+        # yields at least one entry per batch, so the storage generator sets the length.
+        for batch, (disc_obs_batch, disc_demo_obs_batch) in zip(generator, self._extra_mini_batch_iter()):
             original_batch_size = batch.observations.batch_size[0]
+
+            # Wrap AMP observations in a TensorDict so symmetry augmentation can
+            # transform them together with the main batch
+            if disc_obs_batch is not None:
+                disc_obs_batch = TensorDict(
+                    {
+                        "disc_obs_agent": disc_obs_batch,
+                        "disc_obs_demo": disc_demo_obs_batch,
+                    },
+                    batch_size=disc_obs_batch.shape[0],
+                )
 
             # Check if we should normalize advantages per mini-batch
             if self.normalize_advantage_per_mini_batch:
@@ -285,6 +475,9 @@ class PPO:
                     if self.symmetry.use_mirror_loss:
                         loss = loss + self.symmetry.mirror_loss_coeff * symmetry_loss
 
+            # Auxiliary loss (e.g. AMP discriminator)
+            amp_loss, amp_loss_dict = self._compute_aux_loss(batch, disc_obs_batch)
+
             # Compute the gradients for PPO
             self.optimizer.zero_grad()
             loss.backward()
@@ -292,6 +485,9 @@ class PPO:
             if self.rnd:
                 self.rnd.optimizer.zero_grad()
                 rnd_loss.backward()
+
+            # Compute the gradients for auxiliary losses (e.g. AMP discriminator)
+            self._compute_aux_gradients(amp_loss)
 
             # Collect gradients from all GPUs
             if self.is_multi_gpu:
@@ -304,6 +500,8 @@ class PPO:
             # Apply the gradients for RND
             if self.rnd:
                 self.rnd.optimizer.step()
+            # Apply the gradients for auxiliary optimizers (e.g. AMP discriminator)
+            self._step_aux_optimizers()
 
             # Store the losses
             mean_value_loss += value_loss.item()
@@ -315,6 +513,11 @@ class PPO:
             # Symmetry loss
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
+            # AMP loss
+            if mean_amp_loss is not None and amp_loss is not None:
+                mean_amp_loss += amp_loss.item()
+                mean_agent_score += amp_loss_dict["amp/score_agent"]
+                mean_demo_score += amp_loss_dict["amp/score_demo"]
 
         # Update the normalizers
         obs = self.storage.observations.flatten(0, 1)
@@ -332,6 +535,10 @@ class PPO:
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
+        if mean_amp_loss is not None:
+            mean_amp_loss /= num_updates
+            mean_agent_score /= num_updates  # type: ignore
+            mean_demo_score /= num_updates  # type: ignore
 
         # Construct the loss dictionary
         loss_dict = {
@@ -343,6 +550,10 @@ class PPO:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
+        if mean_amp_loss is not None:
+            loss_dict["amp"] = mean_amp_loss
+            loss_dict["agent_score"] = mean_agent_score
+            loss_dict["demo_score"] = mean_demo_score
 
         # Clear the storage
         self.storage.clear()
@@ -355,6 +566,7 @@ class PPO:
         self.critic.train()
         if self.rnd:
             self.rnd.train()
+        self._train_aux_modules()
 
     def eval_mode(self) -> None:
         """Set evaluation mode for learnable models."""
@@ -362,6 +574,7 @@ class PPO:
         self.critic.eval()
         if self.rnd:
             self.rnd.eval()
+        self._eval_aux_modules()
 
     def save(self) -> dict:
         """Return a dict of all models for saving."""
@@ -373,6 +586,7 @@ class PPO:
         if self.rnd:
             saved_dict["rnd_state_dict"] = self.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.rnd.optimizer.state_dict()
+        saved_dict.update(self._aux_save_state())
         return saved_dict
 
     def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
@@ -385,6 +599,7 @@ class PPO:
                 "optimizer": True,
                 "iteration": True,
                 "rnd": True,
+                "amp_discriminator": True,
             }
 
         # Load the specified models
@@ -398,6 +613,7 @@ class PPO:
         if load_cfg.get("rnd") and self.rnd:
             self.rnd.load_state_dict(loaded_dict["rnd_state_dict"], strict=strict)
             self.rnd.optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
+        self._load_aux_state(loaded_dict, load_cfg, strict)
         return load_cfg.get("iteration", False)
 
     def get_policy(self) -> MLPModel:
@@ -414,6 +630,57 @@ class PPO:
         """
         self.actor = compile_model(self._raw_actor, mode)  # type: ignore
         self.critic = compile_model(self._raw_critic, mode)  # type: ignore
+        self._compile_aux_modules(mode)
+
+    @staticmethod
+    def _create_amp_discriminator(
+        obs_groups: dict, amp_cfg: dict, env: VecEnv, device: str
+    ) -> tuple[AMPDiscriminator, CircularBuffer, CircularBuffer]:
+        """Create the AMP discriminator and its observation buffers from a resolved config."""
+        # Parse loss type
+        loss_type_str = amp_cfg.get("loss_type", "LSGAN").upper()
+        if loss_type_str == "GAN":
+            amp_loss_type = AMPLossType.GAN
+        elif loss_type_str == "LSGAN":
+            amp_loss_type = AMPLossType.LSGAN
+        elif loss_type_str == "WGAN":
+            amp_loss_type = AMPLossType.WGAN
+        else:
+            raise ValueError(f"Unknown AMP loss type: {loss_type_str}. Should be 'GAN', 'LSGAN', or 'WGAN'")
+
+        amp_discriminator = AMPDiscriminator(
+            obs_groups=obs_groups,
+            loss_type=amp_loss_type,
+            hidden_dims=amp_cfg.get("hidden_dims", (256, 256, 256)),
+            activation=amp_cfg.get("activation", "elu"),
+            style_reward_scale=amp_cfg.get("style_reward_scale", 1.0),
+            task_style_lerp=amp_cfg.get("task_style_lerp", 0.0),
+            grad_penalty_scale=amp_cfg.get("grad_penalty_scale", 10.0),
+            learning_rate=amp_cfg.get("disc_learning_rate", 5.0e-4),
+            trunk_weight_decay=amp_cfg.get("disc_trunk_weight_decay", 0.0),
+            linear_weight_decay=amp_cfg.get("disc_linear_weight_decay", 0.0),
+            max_grad_norm=amp_cfg.get("disc_max_grad_norm", 0.5),
+            step_dt=amp_cfg.get("step_dt", 0.02),
+            device=device,
+        )
+        amp_discriminator.build_networks(
+            disc_obs_dim=amp_cfg["disc_obs_dim"],
+            hidden_dims=amp_cfg.get("hidden_dims", (256, 256, 256)),
+            activation=amp_cfg.get("activation", "elu"),
+        )
+        print(f"AMP Discriminator Model: {amp_discriminator}")
+
+        disc_obs_buffer = CircularBuffer(
+            max_len=amp_cfg["disc_obs_buffer_size"],
+            batch_size=env.num_envs,
+            device=device,
+        )
+        disc_demo_obs_buffer = CircularBuffer(
+            max_len=amp_cfg["disc_obs_buffer_size"],
+            batch_size=env.num_envs,
+            device=device,
+        )
+        return amp_discriminator, disc_obs_buffer, disc_demo_obs_buffer
 
     @staticmethod
     def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> PPO:
@@ -427,7 +694,13 @@ class PPO:
         default_sets = ["actor", "critic"]
         if "rnd_cfg" in alg_cfg and alg_cfg["rnd_cfg"] is not None:
             default_sets.append("rnd_state")
+        # Add AMP observation groups
+        if "amp_cfg" in alg_cfg and alg_cfg["amp_cfg"] is not None:
+            default_sets.extend(["discriminator", "discriminator_demonstration"])
         cfg["obs_groups"] = resolve_obs_groups(obs, cfg["obs_groups"], default_sets)
+
+        # Resolve AMP config if used
+        alg_cfg = resolve_amp_config(alg_cfg, obs, cfg["obs_groups"], env)
 
         # Resolve RND config if used
         alg_cfg = resolve_rnd_config(alg_cfg, obs, cfg["obs_groups"], env)
@@ -443,11 +716,29 @@ class PPO:
         critic: MLPModel = critic_class(obs, cfg["obs_groups"], "critic", 1, **critic_cfg).to(device)
         print(f"Critic Model: {critic}")
 
+        # Initialize the AMP discriminator and buffers if enabled
+        if "amp_cfg" in alg_cfg and alg_cfg["amp_cfg"] is not None:
+            amp_discriminator, disc_obs_buffer, disc_demo_obs_buffer = PPO._create_amp_discriminator(
+                cfg["obs_groups"], alg_cfg["amp_cfg"], env, device
+            )
+        else:
+            amp_discriminator, disc_obs_buffer, disc_demo_obs_buffer = None, None, None
+
         # Initialize the storage
         storage = RolloutStorage("rl", env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], device)
 
         # Initialize the algorithm
-        alg: PPO = alg_class(actor, critic, storage, device=device, **alg_cfg, multi_gpu_cfg=cfg["multi_gpu"])
+        alg: PPO = alg_class(
+            actor,
+            critic,
+            storage,
+            device=device,
+            amp_discriminator=amp_discriminator,
+            disc_obs_buffer=disc_obs_buffer,
+            disc_demo_obs_buffer=disc_demo_obs_buffer,
+            **alg_cfg,
+            multi_gpu_cfg=cfg["multi_gpu"],
+        )
 
         # Compile the algorithm's models if requested
         alg.compile(cfg.get("torch_compile_mode"))
@@ -460,13 +751,19 @@ class PPO:
         model_params = [self._raw_actor.state_dict(), self._raw_critic.state_dict()]
         if self.rnd:
             model_params.append(self.rnd.predictor.state_dict())
+        model_params.extend(self._aux_broadcast_state_dicts())
         # Broadcast the model parameters
         torch.distributed.broadcast_object_list(model_params, src=0)
         # Load the model parameters on all GPUs from source GPU
-        self._raw_actor.load_state_dict(model_params[0])
-        self._raw_critic.load_state_dict(model_params[1])
+        idx = 0
+        self._raw_actor.load_state_dict(model_params[idx])
+        idx += 1
+        self._raw_critic.load_state_dict(model_params[idx])
+        idx += 1
         if self.rnd:
-            self.rnd.predictor.load_state_dict(model_params[2])
+            self.rnd.predictor.load_state_dict(model_params[idx])
+            idx += 1
+        idx = self._load_aux_broadcast_state_dicts(model_params, idx)
 
     def reduce_parameters(self) -> None:
         """Collect gradients from all GPUs and average them.
@@ -477,6 +774,7 @@ class PPO:
         all_params = chain(self.actor.parameters(), self.critic.parameters())
         if self.rnd:
             all_params = chain(all_params, self.rnd.parameters())
+        all_params = chain(all_params, *self._aux_parameters())
         all_params = list(all_params)
         grads = [param.grad.view(-1) for param in all_params if param.grad is not None]
         all_grads = torch.cat(grads)
