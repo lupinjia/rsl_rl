@@ -1,55 +1,60 @@
-# RSL-RL
+# RSL-RL (Extended)
 
-**RSL-RL** is a GPU-accelerated, lightweight learning library for robotics research. Its compact design allows
-researchers to prototype and test new ideas without the overhead of modifying large, complex libraries. RSL-RL can also
-be used out-of-the-box by installing it via [PyPI](https://pypi.org/project/rsl-rl-lib/), supports multi-GPU training,
-and features common algorithms for robot learning.
+This repository is a fork of [leggedrobotics/rsl_rl](https://github.com/leggedrobotics/rsl_rl) that adds custom implementations for robot motion control on top of the original GPU-accelerated reinforcement learning library.
 
-## Key Features
+## Relationship to the original RSL-RL
 
-- **Minimal, readable codebase** with clear extension points for rapid prototyping.
-- **Robotics-first methods** including PPO and Student-Teacher Distillation.
-- **High-throughput training** with native Multi-GPU support.
-- **Proven performance** in numerous research publications.
+- **Upstream**: [leggedrobotics/rsl_rl](https://github.com/leggedrobotics/rsl_rl) (BSD-3-Clause)
+- This repository fully retains the base capabilities of the original RSL-RL: the PPO and distillation algorithms, `RolloutStorage`, the RND / Symmetry extensions, multi-GPU training, and ONNX / TorchScript export.
+- Custom implementations are layered on top of the upstream code on the `dev` branch. All custom extensions are **opt-in**: when disabled, the behavior is identical to the original RSL-RL.
 
-## Learning Environments
+## Branches
 
-RSL-RL is currently used by the following robot learning libraries:
+| Branch | Description |
+|---|---|
+| `dev` | Main development branch; custom extensions are layered on top of the original RSL-RL (see below) |
 
-- [Isaac Lab](https://github.com/isaac-sim/IsaacLab) (built on top of NVIDIA Isaac Sim)
-- [Legged Gym](https://github.com/leggedrobotics/legged_gym) (built on top of NVIDIA Isaac Gym)
-- [mjlab](https://github.com/mujocolab/mjlab) (built on top of MuJoCo Warp)
-- [MuJoCo Playground](https://github.com/google-deepmind/mujoco_playground) (built on top of MuJoCo MJX and Warp)
+## Custom implementations on the `dev` branch
 
-## Installation
+### AMP (Adversarial Motion Priors) extension
 
-Before installing RSL-RL, ensure that Python `3.9+` is available. It is recommended to install the library in a virtual
-environment (e.g. using `venv` or `conda`), which is often already created by the used environment library (e.g.
-Isaac Lab). If so, make sure to activate it before installing RSL-RL.
+Integrates adversarial motion priors into PPO (see [Peng et al. 2021](https://arxiv.org/abs/2104.02180)): a discriminator learns natural, human-like motion styles from motion demonstrations and provides a style reward that augments the task reward.
 
-### Installing RSL-RL as a dependency
+**Core components:**
 
-```bash
-pip install rsl-rl-lib
-```
+- `rsl_rl/extensions/amp.py` — the `AMPDiscriminator` and the `resolve_amp_config` config resolver
+  - Supports the GAN / LSGAN / WGAN adversarial losses with gradient penalty
+  - Extracts states from the `discriminator` / `discriminator_demonstration` observation groups and outputs a style reward
+  - Style rewards are correctly scaled by `env.unwrapped.step_dt`
+- `rsl_rl/storage/circular_buffer.py` — the `CircularBuffer` ring buffer for storing discriminator observation histories, with mini-batch sampling
+- `rsl_rl/algorithms/ppo.py` — integrates AMP into the PPO main loop through a set of hook methods:
+  - `_process_step_rewards()`: computes the per-step style reward and interpolates (lerps) it with the task reward
+  - `_extra_mini_batch_iter()` / `_compute_aux_loss()`: mini-batch sampling of discriminator observations and loss computation
+  - `_compute_aux_gradients()` / `_step_aux_optimizers()`: trains the discriminator with its own optimizer
+  - `_aux_save_state()` / `_load_aux_state()` and others: save / load / multi-GPU synchronization of the discriminator
+- `rsl_rl/utils/logger.py` — AMP training metrics: `AMP/mean_total_reward`, `AMP/mean_style_reward`, `AMP/style_ratio`
+- `rsl_rl/runners/on_policy_runner.py` — extracts the style rewards in the training loop for logging
 
-### Installing RSL-RL for development
+**Usage:** enable AMP by adding `amp_cfg` to the algorithm config (no need to change the algorithm class or the runner), e.g.:
 
-```bash
-git clone https://github.com/leggedrobotics/rsl_rl
-cd rsl_rl
-pip install -e .
-```
-
-## Citation
-
-If you use RSL-RL in your research, please cite the [paper](https://arxiv.org/abs/2509.10771):
-
-```text
-@article{schwarke2025rslrl,
-  title={RSL-RL: A Learning Library for Robotics Research},
-  author={Schwarke, Clemens and Mittal, Mayank and Rudin, Nikita and Hoeller, David and Hutter, Marco},
-  journal={arXiv preprint arXiv:2509.10771},
-  year={2025}
+```python
+"algorithm": {
+    "class_name": "PPO",
+    "amp_cfg": {
+        "loss_type": "LSGAN",
+        "hidden_dims": [1024, 512],
+        "activation": "elu",
+        "style_reward_scale": 2.0,
+        "task_style_lerp": 0.55,
+        "disc_obs_buffer_size": 100,
+        "disc_learning_rate": 1.0e-4,
+        "grad_penalty_scale": 10.0,
+    },
 }
 ```
+
+The environment observations must also provide the `discriminator` and `discriminator_demonstration` observation groups.
+
+## License
+
+BSD-3-Clause (same as the original RSL-RL).
