@@ -16,3 +16,4 @@ docs/_build/
 .vscode
 
 extra_docs
+.sisyphus
