@@ -121,8 +121,6 @@ class PPO_CTS(PPO):  # ruff: ignore[invalid-class-name]
         self.encoder_optimizer = resolve_optimizer(optimizer)(  # type: ignore
             self.actor.history_encoder.parameters(), lr=self.encoder_lr
         )
-        # KL divergence of the current update, surfaced through the aux-loss metrics.
-        self.last_kl_mean: torch.Tensor | None = None
 
     def _compute_policy_loss(
         self, batch: RolloutStorageCTS.Batch, original_batch_size: int
@@ -130,7 +128,6 @@ class PPO_CTS(PPO):  # ruff: ignore[invalid-class-name]
         """Compute the teacher/student surrogate losses and the combined entropy."""
         if batch.indices is None:
             raise RuntimeError("PPO_CTS requires batch.indices; use RolloutStorageCTS for training.")
-        self.last_kl_mean = None
         obs = batch.observations[:original_batch_size]
         teacher_mask = obs["teacher_mask"].squeeze(-1).bool()
         teacher_indices = teacher_mask.nonzero(as_tuple=False).squeeze(-1)
@@ -155,7 +152,6 @@ class PPO_CTS(PPO):  # ruff: ignore[invalid-class-name]
                     kl_mean = torch.mean(
                         self.actor.get_kl_divergence(teacher_old_params, self.actor.output_distribution_params)
                     )
-                    self.last_kl_mean = kl_mean
                     self._adjust_learning_rate(kl_mean)
         else:
             teacher_surrogate = torch.zeros((), device=obs.device)
@@ -196,40 +192,54 @@ class PPO_CTS(PPO):  # ruff: ignore[invalid-class-name]
                 student_advantages.std() + 1e-8
             )
 
-    def _compute_aux_loss(
-        self, batch: RolloutStorageCTS.Batch, disc_obs_batch: TensorDict | None
-    ) -> tuple[torch.Tensor | None, dict]:
-        """Compute the CTS reconstruction loss in addition to any other auxiliary loss."""
-        amp_loss, amp_metrics = super()._compute_aux_loss(batch, disc_obs_batch)
-        if self.last_kl_mean is not None:
-            amp_metrics = {**amp_metrics, "kl": self.last_kl_mean}
+    def _compute_encoder_loss(self, batch: RolloutStorageCTS.Batch) -> torch.Tensor | None:
+        """Compute the CTS reconstruction loss on the student samples of a batch.
+
+        Returns None when the batch contains no student environments.
+        """
         if batch.indices is None:
-            return amp_loss, amp_metrics
+            return None
         teacher_mask = batch.observations["teacher_mask"].squeeze(-1).bool()
         student_indices = (~teacher_mask).nonzero(as_tuple=False).squeeze(-1)
         if student_indices.numel() == 0:
-            return amp_loss, amp_metrics
+            return None
         student_history = self.storage.get_student_history(batch.indices[student_indices])
         student_privileged = batch.observations["privileged"][student_indices]
         encoder_predictions = self.actor.history_encoder(student_history)
         with torch.no_grad():
             encoder_targets = self.actor.privilege_encoder(student_privileged)
-        reconstruction_loss = nn.functional.mse_loss(encoder_predictions, encoder_targets)
-        combined_loss = reconstruction_loss if amp_loss is None else amp_loss + reconstruction_loss
-        return combined_loss, {**amp_metrics, "cts/reconstruction": reconstruction_loss}
+        return nn.functional.mse_loss(encoder_predictions, encoder_targets)
 
-    def _compute_aux_gradients(self, aux_loss: torch.Tensor | None) -> None:
-        """Zero the auxiliary optimizers and backpropagate the auxiliary loss."""
-        if aux_loss is not None:
-            if self.amp_discriminator is not None:
-                self.amp_discriminator.optimizer.zero_grad()
-            self.encoder_optimizer.zero_grad()
-            aux_loss.backward()
+    def _post_rl_aux_phase(self) -> dict | None:
+        """Train the history encoder after the RL updates (two-phase update).
 
-    def _step_aux_optimizers(self) -> None:
-        """Step the auxiliary optimizers, including the history encoder optimizer."""
-        super()._step_aux_optimizers()
-        self.encoder_optimizer.step()
+        Mirrors the original Concurrent-TS update: once all RL losses have been
+        applied, the encoder is trained to reconstruct the (detached) privilege
+        encoder latent from the stored student histories, re-fitting each
+        mini-batch ``num_encoder_epochs`` times.
+        """
+        if self.actor.is_recurrent or self.critic.is_recurrent:
+            generator = self.storage.recurrent_mini_batch_generator(
+                self.num_mini_batches, self.num_learning_epochs
+            )
+        else:
+            generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+        mean_reconstruction_loss = 0.0
+        num_encoder_updates = 0
+        for batch in generator:
+            for _ in range(self.num_encoder_epochs):
+                reconstruction_loss = self._compute_encoder_loss(batch)
+                if reconstruction_loss is None:
+                    continue
+                self.encoder_optimizer.zero_grad()
+                reconstruction_loss.backward()
+                nn.utils.clip_grad_norm_(self.actor.history_encoder.parameters(), self.max_grad_norm)
+                self.encoder_optimizer.step()
+                mean_reconstruction_loss += reconstruction_loss.item()
+                num_encoder_updates += 1
+        if num_encoder_updates == 0:
+            return None
+        return {"cts/reconstruction": mean_reconstruction_loss / num_encoder_updates}
 
     def _train_aux_modules(self) -> None:
         """Put auxiliary modules into train mode."""

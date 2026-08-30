@@ -379,6 +379,16 @@ class PPO:
         if self.amp_discriminator is not None:
             self.amp_discriminator.optimizer.step()
 
+    def _post_rl_aux_phase(self) -> dict | None:
+        """Run auxiliary training phases after the main RL mini-batch loop.
+
+        Subclasses may override this to train auxiliary modules once the RL
+        policy has been fully updated (e.g. the CTS history encoder
+        reconstruction, mirroring a two-phase update). Returns extra loss
+        metrics merged into the update loss dict, or None.
+        """
+        return None
+
     def _train_aux_modules(self) -> None:
         """Put auxiliary modules into train mode."""
         if self.amp_discriminator is not None:
@@ -551,6 +561,9 @@ class PPO:
                         metric_value = metric_value.item()
                     aux_metric_accum[metric_key] = aux_metric_accum.get(metric_key, 0.0) + metric_value
 
+        # Run post-RL auxiliary training phases (e.g. the CTS history encoder).
+        post_aux_metrics = self._post_rl_aux_phase()
+
         # Update the normalizers
         obs = self.storage.observations.flatten(0, 1)
         self.actor.update_normalization(obs)  # type: ignore
@@ -582,6 +595,8 @@ class PPO:
             loss_dict["symmetry"] = mean_symmetry_loss
         if has_aux_loss:
             loss_dict.update(aux_metric_accum)
+        if post_aux_metrics:
+            loss_dict.update(post_aux_metrics)
 
         # Clear the storage
         self.storage.clear()

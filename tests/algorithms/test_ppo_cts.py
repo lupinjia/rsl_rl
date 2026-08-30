@@ -201,6 +201,40 @@ class TestCtsUpdate:
             "history encoder should update from the reconstruction loss"
         )
 
+    def test_reconstruction_trained_in_post_rl_phase(self) -> None:
+        """Reconstruction loss is trained in a post-RL phase.
+
+        The RL mini-batch loop must not compute the reconstruction loss; it runs in a
+        dedicated post-RL phase, mirroring the original two-phase update.
+        """
+        alg, obs = _build_cts()
+        alg.train_mode()
+        _rollout(alg, obs)
+        alg.compute_returns(obs)
+
+        # The per-mini-batch auxiliary loss must not contain the reconstruction metric.
+        generator = alg.storage.mini_batch_generator(alg.num_mini_batches, alg.num_learning_epochs)
+        _, metrics = alg._compute_aux_loss(next(iter(generator)), None)
+        assert "cts/reconstruction" not in metrics, "reconstruction must not be in the RL loop"
+
+        # The encoder must not change from the RL mini-batch loop alone: run only the
+        # policy/aux backward+step pass and check the encoder stays frozen.
+        encoder_lr_before = alg.encoder_optimizer.param_groups[0]["lr"]
+        hist_before = {name: p.clone() for name, p in alg.actor.history_encoder.named_parameters()}
+        for batch, (_disc_obs, _disc_demo) in zip(generator, alg._extra_mini_batch_iter()):
+            surrogate_loss, _ = alg._compute_policy_loss(batch, batch.observations.batch_size[0])
+            aux_loss, _ = alg._compute_aux_loss(batch, None)
+            alg.optimizer.zero_grad()
+            surrogate_loss.backward()
+            alg._compute_aux_gradients(aux_loss)
+            alg.optimizer.step()
+            alg._step_aux_optimizers()
+        hist_after = {name: p.clone() for name, p in alg.actor.history_encoder.named_parameters()}
+        assert all(torch.equal(hist_before[name], hist_after[name]) for name in hist_before), (
+            "history encoder must stay frozen during the RL mini-batch loop"
+        )
+        assert alg.encoder_optimizer.param_groups[0]["lr"] == encoder_lr_before
+
 
 class TestCtsEncoderLearningRate:
     """Tests for the history-encoder learning-rate scaling."""
