@@ -211,7 +211,82 @@ class PPO:
         st.advantages = st.returns - st.values
         # Normalize the advantages if per minibatch normalization is not used
         if not self.normalize_advantage_per_mini_batch:
-            st.advantages = (st.advantages - st.advantages.mean()) / (st.advantages.std() + 1e-8)
+            self._normalize_advantages()
+
+    def _normalize_advantages(self) -> None:
+        """Normalize the stored advantages over the current rollout.
+
+        The default implementation normalizes globally over all environments. Extensions
+        that use per-group normalization (e.g. Concurrent Teacher-Student normalizing the
+        teacher and student environments independently) override this method.
+        """
+        st = self.storage
+        st.advantages = (st.advantages - st.advantages.mean()) / (st.advantages.std() + 1e-8)
+
+    def _compute_policy_loss(
+        self, batch: RolloutStorage.Batch, original_batch_size: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute the policy (surrogate) loss and the entropy for a mini-batch.
+
+        Runs a single actor forward pass over the whole ``batch``, adapts the learning
+        rate based on the KL divergence when adaptive scheduling is enabled, and returns
+        ``(surrogate_loss, entropy)`` where ``entropy`` corresponds to the original
+        (pre-augmentation) samples.
+
+        Extensions that restructure the policy forward pass (e.g. Concurrent Teacher-Student
+        with per-observation-group forward passes) override this method while preserving the
+        return contract.
+        """
+        # Recompute actions log prob and entropy for current batch of transitions
+        # Note: We need to do this because we updated the policy with new parameters
+        self.actor(
+            batch.observations,
+            masks=batch.masks,
+            hidden_state=batch.hidden_states[0],
+            stochastic_output=True,
+        )
+        actions_log_prob = self.actor.get_output_log_prob(batch.actions)  # type: ignore
+        # Note: We only keep the following tensors for the original samples in case of symmetry augmentation
+        distribution_params = tuple(p[:original_batch_size] for p in self.actor.output_distribution_params)
+        entropy = self.actor.output_entropy[:original_batch_size]
+
+        # Compute KL divergence and adapt the learning rate
+        if self.desired_kl is not None and self.schedule == "adaptive":
+            with torch.inference_mode():
+                kl = self.actor.get_kl_divergence(batch.old_distribution_params, distribution_params)  # type: ignore
+                kl_mean = torch.mean(kl)
+
+                # Reduce the KL divergence across all GPUs
+                if self.is_multi_gpu:
+                    torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
+                    kl_mean /= self.gpu_world_size
+
+                # Update the learning rate only on the main process
+                if self.gpu_global_rank == 0:
+                    if kl_mean > self.desired_kl * 2.0:
+                        self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                    elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
+                        self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+
+                # Update the learning rate for all GPUs
+                if self.is_multi_gpu:
+                    lr_tensor = torch.tensor(self.learning_rate, device=self.device)
+                    torch.distributed.broadcast(lr_tensor, src=0)
+                    self.learning_rate = lr_tensor.item()
+
+                # Update the learning rate for all parameter groups
+                for param_group in self.optimizer.param_groups:
+                    param_group["lr"] = self.learning_rate
+
+        # Surrogate loss
+        ratio = torch.exp(actions_log_prob - torch.squeeze(batch.old_actions_log_prob))  # type: ignore
+        surrogate = -torch.squeeze(batch.advantages) * ratio  # type: ignore
+        surrogate_clipped = -torch.squeeze(batch.advantages) * torch.clamp(  # type: ignore
+            ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
+        )
+        surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+
+        return surrogate_loss, entropy
 
     def _process_step_rewards(
         self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
@@ -282,10 +357,16 @@ class PPO:
         """
         if self.amp_discriminator is None or disc_obs_batch is None:
             return None, {}
-        amp_loss, amp_loss_dict = self.amp_discriminator.compute_loss(
+        amp_loss, amp_metrics = self.amp_discriminator.compute_loss(
             disc_obs_batch["disc_obs_agent"], disc_obs_batch["disc_obs_demo"]
         )
-        return amp_loss, amp_loss_dict
+        # Expose the loss and its metrics under stable loss-dict keys. The score metrics
+        # returned by ``compute_loss`` are python floats.
+        return amp_loss, {
+            "amp": amp_loss,
+            "agent_score": amp_metrics["amp/score_agent"],
+            "demo_score": amp_metrics["amp/score_demo"],
+        }
 
     def _compute_aux_gradients(self, aux_loss: torch.Tensor | None) -> None:
         """Zero and backpropagate an auxiliary loss (e.g. AMP discriminator loss)."""
@@ -359,15 +440,9 @@ class PPO:
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
         mean_symmetry_loss = 0 if self.symmetry else None
-        # AMP loss
-        if self.amp_discriminator is not None:
-            mean_amp_loss = 0.0
-            mean_agent_score = 0.0
-            mean_demo_score = 0.0
-        else:
-            mean_amp_loss = None
-            mean_agent_score = None
-            mean_demo_score = None
+        # Auxiliary loss metrics (e.g. AMP discriminator, CTS reconstruction)
+        aux_metric_accum: dict[str, float] = {}
+        has_aux_loss = False
 
         # Get mini-batch generator
         if self.actor.is_recurrent or self.critic.is_recurrent:
@@ -405,55 +480,10 @@ class PPO:
             with torch.amp.autocast(  # type: ignore
                 device_type=torch.device(self.device).type, enabled=self.use_mixed_precision, dtype=torch.bfloat16
             ):
-                # Recompute actions log prob and entropy for current batch of transitions
-                # Note: We need to do this because we updated the policy with new parameters
-                self.actor(
-                    batch.observations,
-                    masks=batch.masks,
-                    hidden_state=batch.hidden_states[0],
-                    stochastic_output=True,
-                )
-                actions_log_prob = self.actor.get_output_log_prob(batch.actions)  # type: ignore
+                # Recompute actions log prob and entropy for current batch of transitions.
+                # Note: We need to do this because we updated the policy with new parameters.
+                surrogate_loss, entropy = self._compute_policy_loss(batch, original_batch_size)
                 values = self.critic(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1])
-                # Note: We only keep the following tensors for the original samples in case of symmetry augmentation
-                distribution_params = tuple(p[:original_batch_size] for p in self.actor.output_distribution_params)
-                entropy = self.actor.output_entropy[:original_batch_size]
-
-                # Compute KL divergence and adapt the learning rate
-                if self.desired_kl is not None and self.schedule == "adaptive":
-                    with torch.inference_mode():
-                        kl = self.actor.get_kl_divergence(batch.old_distribution_params, distribution_params)  # type: ignore
-                        kl_mean = torch.mean(kl)
-
-                        # Reduce the KL divergence across all GPUs
-                        if self.is_multi_gpu:
-                            torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
-                            kl_mean /= self.gpu_world_size
-
-                        # Update the learning rate only on the main process
-                        if self.gpu_global_rank == 0:
-                            if kl_mean > self.desired_kl * 2.0:
-                                self.learning_rate = max(1e-5, self.learning_rate / 1.5)
-                            elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                                self.learning_rate = min(1e-2, self.learning_rate * 1.5)
-
-                        # Update the learning rate for all GPUs
-                        if self.is_multi_gpu:
-                            lr_tensor = torch.tensor(self.learning_rate, device=self.device)
-                            torch.distributed.broadcast(lr_tensor, src=0)
-                            self.learning_rate = lr_tensor.item()
-
-                        # Update the learning rate for all parameter groups
-                        for param_group in self.optimizer.param_groups:
-                            param_group["lr"] = self.learning_rate
-
-                # Surrogate loss
-                ratio = torch.exp(actions_log_prob - torch.squeeze(batch.old_actions_log_prob))  # type: ignore
-                surrogate = -torch.squeeze(batch.advantages) * ratio  # type: ignore
-                surrogate_clipped = -torch.squeeze(batch.advantages) * torch.clamp(  # type: ignore
-                    ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
-                )
-                surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
                 # Value function loss
                 if self.use_clipped_value_loss:
@@ -475,8 +505,8 @@ class PPO:
                     if self.symmetry.use_mirror_loss:
                         loss = loss + self.symmetry.mirror_loss_coeff * symmetry_loss
 
-            # Auxiliary loss (e.g. AMP discriminator)
-            amp_loss, amp_loss_dict = self._compute_aux_loss(batch, disc_obs_batch)
+            # Auxiliary loss (e.g. AMP discriminator, CTS reconstruction)
+            aux_loss, aux_loss_dict = self._compute_aux_loss(batch, disc_obs_batch)
 
             # Compute the gradients for PPO
             self.optimizer.zero_grad()
@@ -487,7 +517,7 @@ class PPO:
                 rnd_loss.backward()
 
             # Compute the gradients for auxiliary losses (e.g. AMP discriminator)
-            self._compute_aux_gradients(amp_loss)
+            self._compute_aux_gradients(aux_loss)
 
             # Collect gradients from all GPUs
             if self.is_multi_gpu:
@@ -513,11 +543,13 @@ class PPO:
             # Symmetry loss
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
-            # AMP loss
-            if mean_amp_loss is not None and amp_loss is not None:
-                mean_amp_loss += amp_loss.item()
-                mean_agent_score += amp_loss_dict["amp/score_agent"]
-                mean_demo_score += amp_loss_dict["amp/score_demo"]
+            # Accumulate auxiliary loss metrics
+            if aux_loss is not None:
+                has_aux_loss = True
+                for metric_key, metric_value in aux_loss_dict.items():
+                    if torch.is_tensor(metric_value):
+                        metric_value = metric_value.item()
+                    aux_metric_accum[metric_key] = aux_metric_accum.get(metric_key, 0.0) + metric_value
 
         # Update the normalizers
         obs = self.storage.observations.flatten(0, 1)
@@ -535,10 +567,8 @@ class PPO:
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
-        if mean_amp_loss is not None:
-            mean_amp_loss /= num_updates
-            mean_agent_score /= num_updates  # type: ignore
-            mean_demo_score /= num_updates  # type: ignore
+        if has_aux_loss:
+            aux_metric_accum = {key: value / num_updates for key, value in aux_metric_accum.items()}
 
         # Construct the loss dictionary
         loss_dict = {
@@ -550,10 +580,8 @@ class PPO:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
-        if mean_amp_loss is not None:
-            loss_dict["amp"] = mean_amp_loss
-            loss_dict["agent_score"] = mean_agent_score
-            loss_dict["demo_score"] = mean_demo_score
+        if has_aux_loss:
+            loss_dict.update(aux_metric_accum)
 
         # Clear the storage
         self.storage.clear()
@@ -619,6 +647,15 @@ class PPO:
     def get_policy(self) -> MLPModel:
         """Get the policy model."""
         return self._raw_actor
+
+    @staticmethod
+    def _create_storage(env: VecEnv, cfg: dict, obs: TensorDict, device: str) -> RolloutStorage:
+        """Create the rollout storage for the training setup.
+
+        Extensions that need a custom storage (e.g. Concurrent Teacher-Student with a
+        student-only history buffer) override this factory.
+        """
+        return RolloutStorage("rl", env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], device)
 
     def compile(self, mode: str | None = None) -> None:
         """Compile actor and critic with ``torch.compile``.
@@ -725,7 +762,7 @@ class PPO:
             amp_discriminator, disc_obs_buffer, disc_demo_obs_buffer = None, None, None
 
         # Initialize the storage
-        storage = RolloutStorage("rl", env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], device)
+        storage = alg_class._create_storage(env, cfg, obs, device)
 
         # Initialize the algorithm
         alg: PPO = alg_class(

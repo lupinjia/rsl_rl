@@ -84,6 +84,7 @@ class RolloutStorage:
             masks: torch.Tensor | None = None,
             privileged_actions: torch.Tensor | None = None,
             dones: torch.Tensor | None = None,
+            indices: torch.Tensor | None = None,
         ) -> None:
             """Initialize a batch container over rollout data."""
             self.observations: TensorDict | None = observations
@@ -121,6 +122,9 @@ class RolloutStorage:
 
             self.masks: torch.Tensor | None = masks
             """Batch of trajectory masks for recurrent networks (RL recurrent only)."""
+
+            self.indices: torch.Tensor | None = indices
+            """Flattened sample indices within the rollout buffer (for extensions)."""
 
     def __init__(
         self,
@@ -255,6 +259,7 @@ class RolloutStorage:
                     returns=returns[batch_idx],
                     old_actions_log_prob=old_actions_log_prob[batch_idx],
                     old_distribution_params=tuple(p[batch_idx] for p in old_distribution_params),
+                    indices=batch_idx,
                 )
 
     # For reinforcement learning with recurrent networks
@@ -289,7 +294,8 @@ class RolloutStorage:
                 # take a batch of trajectories and finally reshape back to [num_layers, batch, hidden_dim]
                 if self.saved_hidden_state_a is not None:
                     hidden_state_a_batch = [
-                        saved_hidden_state.permute(2, 0, 1, 3)[last_was_done][first_traj:last_traj]
+                        saved_hidden_state
+                        .permute(2, 0, 1, 3)[last_was_done][first_traj:last_traj]
                         .transpose(1, 0)
                         .contiguous()
                         for saved_hidden_state in self.saved_hidden_state_a
@@ -302,7 +308,8 @@ class RolloutStorage:
                     hidden_state_a_batch = None
                 if self.saved_hidden_state_c is not None:
                     hidden_state_c_batch = [
-                        saved_hidden_state.permute(2, 0, 1, 3)[last_was_done][first_traj:last_traj]
+                        saved_hidden_state
+                        .permute(2, 0, 1, 3)[last_was_done][first_traj:last_traj]
                         .transpose(1, 0)
                         .contiguous()
                         for saved_hidden_state in self.saved_hidden_state_c

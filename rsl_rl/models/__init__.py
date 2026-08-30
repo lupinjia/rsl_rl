@@ -6,11 +6,13 @@
 """Neural models for the learning algorithm."""
 
 from .cnn_model import CNNModel
+from .cts_actor import CtsActor
 from .mlp_model import MLPModel
 from .rnn_model import RNNModel
 
 __all__ = [
     "CNNModel",
+    "CtsActor",
     "MLPModel",
     "RNNModel",
 ]
