@@ -74,6 +74,43 @@ The environment observations must provide the `policy`, `privileged`, `history`,
 
 Implementation details: see [extra_docs/cts.md](extra_docs/cts.md).
 
+### CTS-Depth extension
+
+Extends CTS with depth-image perception: the student additionally encodes a stack of depth camera frames (plus the observation history) with a recurrent depth estimator (CNN + GRU), while the teacher perceives a terrain heightmap grid with a CNN encoder. The student is trained to reconstruct both the privileged latent and the heightmap latent from the depth+history input through four auxiliary losses, applied in the same two-phase update as plain CTS. Depth images and history are stored student-only.
+
+**Usage:** same as CTS, but select the depth-aware classes and add the `heightmap` / `depth_image` observation groups:
+
+```python
+"algorithm": {
+    "class_name": "rsl_rl.algorithms.ppo_cts_depth:PPO_CTSDepth",
+    "cts_cfg": {
+        "encoder_lr": 5.0e-4,
+        "num_encoder_epochs": 1,
+    },
+},
+"actor": {
+    "class_name": "rsl_rl.models.cts_depth_actor:CtsDepthActor",
+    "num_privilege_latent_dims": 32,
+    "num_heightmap_latent_dims": 64,
+    "depth_cnn_channel_dims": [4],
+    "depth_cnn_kernel_sizes": [3],
+    "history_mlp_dims": [256, 128],
+    "rnn_hidden_dim": 512,
+},
+"obs_groups": {
+    "actor": ["actor"],
+    "critic": ["critic"],
+    "privileged": ["privileged"],
+    "history": ["history"],
+    "heightmap": ["heightmap"],
+    "depth_image": ["depth_image"],
+},
+```
+
+The environment must provide the CTS groups plus `heightmap` (a 2D terrain height grid, e.g. `[B, 1, H, W]`) and `depth_image` (a stacked depth stack, e.g. `[B, N, H, W]`). `num_teacher` follows the same environment property as CTS.
+
+Implementation details: see [extra_docs/cts_depth.md](extra_docs/cts_depth.md).
+
 ## License
 
 BSD-3-Clause (same as the original RSL-RL).

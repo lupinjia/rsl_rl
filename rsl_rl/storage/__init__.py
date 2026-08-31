@@ -8,5 +8,6 @@
 from .circular_buffer import CircularBuffer
 from .rollout_storage import RolloutStorage
 from .rollout_storage_cts import RolloutStorageCTS
+from .rollout_storage_cts_depth import RolloutStorageCTSDepth
 
-__all__ = ["CircularBuffer", "RolloutStorage", "RolloutStorageCTS"]
+__all__ = ["CircularBuffer", "RolloutStorage", "RolloutStorageCTS", "RolloutStorageCTSDepth"]

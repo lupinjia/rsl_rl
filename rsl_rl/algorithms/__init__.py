@@ -8,5 +8,6 @@
 from .distillation import Distillation
 from .ppo import PPO
 from .ppo_cts import PPO_CTS
+from .ppo_cts_depth import PPO_CTSDepth
 
-__all__ = ["PPO", "PPO_CTS", "Distillation"]
+__all__ = ["PPO", "PPO_CTS", "Distillation", "PPO_CTSDepth"]

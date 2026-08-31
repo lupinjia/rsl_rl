@@ -7,6 +7,7 @@
 
 from .cnn import CNN
 from .distribution import BetaDistribution, Distribution, GaussianDistribution, HeteroscedasticGaussianDistribution
+from .heightmap_estimator import HeightmapEstimator
 from .mlp import MLP
 from .normalization import EmpiricalDiscountedVariationNormalization, EmpiricalNormalization
 from .rnn import RNN, HiddenState
@@ -20,6 +21,7 @@ __all__ = [
     "EmpiricalDiscountedVariationNormalization",
     "EmpiricalNormalization",
     "GaussianDistribution",
+    "HeightmapEstimator",
     "HeteroscedasticGaussianDistribution",
     "HiddenState",
 ]

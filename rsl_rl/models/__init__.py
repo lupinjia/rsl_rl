@@ -7,12 +7,14 @@
 
 from .cnn_model import CNNModel
 from .cts_actor import CtsActor
+from .cts_depth_actor import CtsDepthActor
 from .mlp_model import MLPModel
 from .rnn_model import RNNModel
 
 __all__ = [
     "CNNModel",
     "CtsActor",
+    "CtsDepthActor",
     "MLPModel",
     "RNNModel",
 ]

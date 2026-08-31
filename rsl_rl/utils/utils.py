@@ -401,3 +401,13 @@ def unpad_trajectories(trajectories: torch.Tensor | TensorDict, masks: torch.Ten
     else:
         # For standard Tensors, we must explicitly handle feature dimensions in view()
         return valid_steps.view(-1, trajectories.shape[0], *trajectories.shape[2:]).transpose(1, 0)
+
+
+def unpad_trajectories_flat(trajectories: torch.Tensor | TensorDict, masks: torch.Tensor) -> torch.Tensor | TensorDict:
+    """Select the valid padded rows in trajectory order, as a flat sequence.
+
+    Unlike :func:`unpad_trajectories` (which reshapes into
+    ``[max_len, n_valid // max_len, ...]``), this keeps the classic flat semantics:
+    the result has ``sum(masks)`` rows ordered env-major / time-ascending.
+    """
+    return trajectories.transpose(1, 0)[masks.transpose(1, 0)]
