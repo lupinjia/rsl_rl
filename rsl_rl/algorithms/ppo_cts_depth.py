@@ -227,7 +227,13 @@ class PPO_CTSDepth(PPO_CTS):  # ruff: ignore[invalid-class-name]
         return {f"cts_depth/{key}": value / num_aux_updates for key, value in metrics.items()}
 
     def _compute_depth_aux_losses(self, batch: RolloutStorageCTSDepth.Batch) -> dict[str, torch.Tensor] | None:
-        """Run one M2 sequential auxiliary update and return the per-loss values."""
+        """Run one sequential auxiliary update and return the per-loss values.
+
+        The four losses are optimized sequentially: each loss sees the parameters
+        updated by the previous one, mirroring the original ppo_cts_depth. This is
+        equivalent to the source's four separate optimizers because Adam state is
+        per-parameter and all of them share the same learning rate.
+        """
         if batch.student_observations is None:
             return None
         student_masks = batch.student_masks

@@ -78,6 +78,8 @@ Implementation details: see [extra_docs/cts.md](extra_docs/cts.md).
 
 Extends CTS with depth-image perception: the student additionally encodes a stack of depth camera frames (plus the observation history) with a recurrent depth estimator (CNN + GRU), while the teacher perceives a terrain heightmap grid with a CNN encoder. The student is trained to reconstruct both the privileged latent and the heightmap latent from the depth+history input through four auxiliary losses, applied in the same two-phase update as plain CTS. Depth images and history are stored student-only.
 
+This extension implements the **Vision-CTS** learning framework from *LIPM-Guided Reinforcement Learning for Stable and Perceptive Locomotion in Bipedal Robots* (Su et al., [arXiv:2509.09106](https://www.alphaxiv.org/abs/2509.09106), 2025).
+
 **Usage:** same as CTS, but select the depth-aware classes and add the `heightmap` / `depth_image` observation groups:
 
 ```python
