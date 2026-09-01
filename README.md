@@ -16,6 +16,12 @@ This repository is a fork of [leggedrobotics/rsl_rl](https://github.com/leggedro
 
 ## Custom implementations on the `dev` branch
 
+This fork layers the following custom methods on top of the original RSL-RL (all opt-in):
+
+- [**AMP (Adversarial Motion Priors)**](#amp-adversarial-motion-priors-extension) — injects natural, human-like motion style from demonstrations via a discriminator style reward
+- [**CTS (Concurrent Teacher-Student)**](#cts-concurrent-teacher-student-extension) — concurrent distillation from a privileged teacher to a history-based student sharing one policy
+- [**CTS-Depth**](#cts-depth-extension) — CTS extended with depth-image perception for the student and a terrain heightmap for the teacher (Vision-CTS)
+
 ### AMP (Adversarial Motion Priors) extension
 
 Integrates adversarial motion priors into PPO (see [Peng et al. 2021](https://arxiv.org/abs/2104.02180)): a discriminator learns natural, human-like motion styles from motion demonstrations and provides a style reward that augments the task reward.
@@ -39,8 +45,6 @@ Integrates adversarial motion priors into PPO (see [Peng et al. 2021](https://ar
 ```
 
 The environment observations must also provide the `discriminator` and `discriminator_demonstration` observation groups.
-
-Implementation details: see [extra_docs/amp.md](extra_docs/amp.md).
 
 ### CTS (Concurrent Teacher-Student) extension
 
@@ -71,8 +75,6 @@ Integrates concurrent teacher-student distillation into PPO (see the [Concurrent
 ```
 
 The environment observations must provide the `policy`, `privileged`, `history`, `critic` and `teacher_mask` groups, where `teacher_mask` is `1` for the first `num_teacher` environments and `0` otherwise. The teacher count is an **environment property** (read from `env.num_teacher`); when the environment config leaves it unset it defaults to 3/4 of the environment count, resolved at construction time — so overriding `num_envs` on the command line (e.g. `--env.scene.num_envs`) keeps the teacher split consistent automatically.
-
-Implementation details: see [extra_docs/cts.md](extra_docs/cts.md).
 
 ### CTS-Depth extension
 
@@ -110,8 +112,6 @@ This extension implements the **Vision-CTS** learning framework from *LIPM-Guide
 ```
 
 The environment must provide the CTS groups plus `heightmap` (a 2D terrain height grid, e.g. `[B, 1, H, W]`) and `depth_image` (a stacked depth stack, e.g. `[B, N, H, W]`). `num_teacher` follows the same environment property as CTS.
-
-Implementation details: see [extra_docs/cts_depth.md](extra_docs/cts_depth.md).
 
 ## License
 
