@@ -302,7 +302,14 @@ class _TorchCtsDepthActor(nn.Module):
 
 
 class _OnnxCtsDepthActor(nn.Module):
-    """Exportable student-mode depth-aware CTS actor for ONNX."""
+    """Exportable student-mode depth-aware CTS actor for ONNX.
+
+    Stateful inference is not supported by ONNX Runtime (module buffers are static
+    in the graph), so the GRU hidden state is an explicit input/output pair managed
+    by the caller. The three observation sources arrive as separate tensors: the
+    current policy observation, the flat history, and the depth stack kept in its
+    ``[B, C, H, W]`` layout.
+    """
 
     is_recurrent: bool = True
 
@@ -324,39 +331,45 @@ class _OnnxCtsDepthActor(nn.Module):
             self.deterministic_output = model.distribution.as_deterministic_output_module()
         else:
             self.deterministic_output = nn.Identity()
-        self.input_size = model.obs_dim + model.history_dim + math.prod(self.depth_shape)
-        self.register_buffer("hidden_state", torch.zeros(self.rnn.num_layers, 1, self.rnn.hidden_size))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Run deterministic student-mode inference for ONNX export."""
-        policy_obs = self.obs_normalizer(x[:, : self.policy_obs_dim])
-        obs_history = x[:, self.policy_obs_dim : self.policy_obs_dim + self.history_dim]
-        depth = x[:, self.policy_obs_dim + self.history_dim :].view(-1, *self.depth_shape)
+    def forward(
+        self,
+        policy_obs: torch.Tensor,
+        obs_history: torch.Tensor,
+        depth: torch.Tensor,
+        hidden_state: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run deterministic student-mode inference with an external GRU state."""
+        policy_obs = self.obs_normalizer(policy_obs)
         depth_encoding = self.depth_cnn(depth)
         history_encoding = self.history_mlp(obs_history)
         rnn_input = torch.cat([history_encoding, depth_encoding], dim=-1)
-        rnn_out, h = self.rnn(rnn_input.unsqueeze(0), self.hidden_state)
-        self.hidden_state[:] = h  # type: ignore
+        rnn_out, h = self.rnn(rnn_input.unsqueeze(0), hidden_state)
         hm_latent = self.latent_output_mlp(rnn_out.squeeze(0))
         priv_latent = self.privilege_estimator(obs_history)
         out = self.mlp(torch.cat([policy_obs, priv_latent, hm_latent], dim=-1))
-        return self.deterministic_output(out)
+        return self.deterministic_output(out), h
 
-    def get_dummy_inputs(self) -> tuple[torch.Tensor]:
+    def get_dummy_inputs(self) -> tuple[torch.Tensor, ...]:
         """Return representative dummy inputs for ONNX tracing."""
-        return (torch.zeros(1, self.input_size),)
+        return (
+            torch.zeros(1, self.policy_obs_dim),
+            torch.zeros(1, self.history_dim),
+            torch.zeros(1, *self.depth_shape),
+            torch.zeros(self.rnn.num_layers, 1, self.rnn.hidden_size),
+        )
 
     @property
     def input_names(self) -> list[str]:
         """ONNX input tensor names."""
-        return ["obs"]
+        return ["current_obs", "obs_history", "depth_image", "hidden_state"]
 
     @property
     def output_names(self) -> list[str]:
-        """ONNX output tensor names."""
-        return ["actions"]
+        """ONNX output tensor names.
 
-    @torch.jit.export
-    def reset(self) -> None:
-        """Reset the recurrent hidden state to zeros."""
-        self.hidden_state[:] = 0.0  # type: ignore
+        The carried state output is named ``new_hidden_state`` (distinct from the
+        ``hidden_state`` input) because ONNX graphs are in single static assignment
+        form: an input and an output may not share a name.
+        """
+        return ["actions", "new_hidden_state"]

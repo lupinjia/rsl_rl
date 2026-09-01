@@ -238,3 +238,36 @@ class TestCtsDepthInference:
         )
         out = jit_mod(flat)
         assert out.shape == (1, NUM_ACTIONS)
+
+    def test_onnx_export_takes_split_inputs_and_external_hidden_state(self) -> None:
+        """ONNX export must take separate (obs, history, depth) tensors plus a hidden state."""
+        alg, _ = _build_ctsdepth()
+        alg.eval_mode()
+        onnx_mod = alg.actor.as_onnx(verbose=False)
+        onnx_mod.eval()
+
+        assert onnx_mod.input_names == ["current_obs", "obs_history", "depth_image", "hidden_state"]
+        assert onnx_mod.output_names == ["actions", "new_hidden_state"]
+
+        policy_obs, obs_history, depth, hidden_state = onnx_mod.get_dummy_inputs()
+        assert policy_obs.shape == (1, OBS_DIM)
+        assert obs_history.shape == (1, HISTORY_DIM)
+        assert depth.shape == (1, *DEPTH_SHAPE), "depth must not be flattened"
+        assert hidden_state.shape == (1, 1, 16)  # rnn_num_layers=1, hidden=16
+
+        with torch.no_grad():
+            actions, h = onnx_mod(policy_obs, obs_history, depth, hidden_state)
+        assert actions.shape == (1, NUM_ACTIONS)
+        assert h.shape == hidden_state.shape
+
+    def test_onnx_hidden_state_is_an_input(self) -> None:
+        """The exported hidden state must influence the output (external state)."""
+        alg, _ = _build_ctsdepth()
+        alg.eval_mode()
+        onnx_mod = alg.actor.as_onnx(verbose=False)
+        onnx_mod.eval()
+        policy_obs, obs_history, depth, _ = onnx_mod.get_dummy_inputs()
+        with torch.no_grad():
+            a_zero, _ = onnx_mod(policy_obs, obs_history, depth, torch.zeros(1, 1, 16))
+            a_rand, _ = onnx_mod(policy_obs, obs_history, depth, torch.randn(1, 1, 16))
+        assert not torch.allclose(a_zero, a_rand), "hidden state input must affect the output"
